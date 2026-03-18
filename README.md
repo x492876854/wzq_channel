@@ -11,8 +11,9 @@
   "accounts": {
     "default": {
       "enabled": true,
-      "token": "123456",
-      "wsUrl": "ws://127.0.0.1:12599" # 微证券
+      "token": "",    # 必填，用于文件下载token
+      "fileUrl": "",  # 文件下载链接，例如 http://9.134.53.188:8280/svr/openclaw/agent/get_image
+      "wsUrl": "" # 微证券websocket服务端url，例如 ws://9.134.53.188:19113/test
     }
   }
 }
@@ -47,9 +48,15 @@
 
 ### 坑点注意
 1. 异步任务的返回可能会受到多channel的影响导致失败（日志会打印），如cron提醒，保留一个channel即可，其他可以配置不启用
-
-
-
-### 待完成
-1. 图片拉取，图片返回格式
+2. 若要支持图片，需要能处理图片的模型，需要在openclaw.json配置
+```
+"agents": {
+    "defaults": {
+       "imageModel": {
+           "primary": "claude/claude-sonnet-4-6" // 看图的模型
+        }
+    }
+}
+```
+3. outbound的resolveTarget控制，消息通知投送给谁，先设置成default
 

@@ -10,6 +10,9 @@ export type MyWsChannelConfig = {
   wsUrl?: string;
   /** 可选的鉴权 token，将以 Bearer 方式放入 Authorization 请求头 */
   token?: string;
+  /** 图片下载地址 */
+  fileUrl?: string;
+
   /** 允许接收消息的发送者 ID 列表 */
   allowFrom?: string[];
   /** 默认发送目标 */
@@ -25,6 +28,7 @@ export type ResolvedMyWsAccount = {
   accountId: string;
   wsUrl: string;
   token: string | undefined;
+  fileUrl: string;
   enabled: boolean;
   configured: boolean;
   config: MyWsChannelConfig;
@@ -54,6 +58,7 @@ export function resolveMyWsAccount(
 
   const wsUrl = accountCfg.wsUrl?.trim() ?? "";
   const token = accountCfg.token?.trim() || undefined;
+  const fileUrl = accountCfg.fileUrl.trim() ?? "";
   const enabled = accountCfg.enabled !== false;
   const configured = Boolean(wsUrl);
 
@@ -61,6 +66,7 @@ export function resolveMyWsAccount(
     accountId: resolvedId,
     wsUrl,
     token,
+    fileUrl,
     enabled,
     configured,
     config: accountCfg,

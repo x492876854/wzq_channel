@@ -51,7 +51,7 @@ export const myWsPlugin: ChannelPlugin<ResolvedMyWsAccount> = {
   // ── 能力声明 ──────────────────────────────────────────────
   capabilities: {
     chatTypes: ["direct"],
-    media: false,
+    media: true,
     blockStreaming: true,
   },
 
@@ -79,7 +79,7 @@ export const myWsPlugin: ChannelPlugin<ResolvedMyWsAccount> = {
         cfg,
         sectionKey: "wzq-channel",
         accountId,
-        clearBaseFields: ["wsUrl", "token", "allowFrom", "defaultTo"],
+        clearBaseFields: ["wsUrl", "token", "fileUrl", "allowFrom", "defaultTo"],
       }),
     isConfigured: (account) => account.configured,
     describeAccount: (account) => ({
@@ -87,6 +87,7 @@ export const myWsPlugin: ChannelPlugin<ResolvedMyWsAccount> = {
       enabled: account.enabled,
       configured: account.configured,
       wsUrl: account.wsUrl,
+      fileUrl: account.fileUrl
     }),
     resolveAllowFrom: ({ cfg, accountId }) =>
       (resolveMyWsAccount(cfg, accountId).config.allowFrom ?? []).map((entry) => String(entry)),
@@ -186,16 +187,10 @@ export const myWsPlugin: ChannelPlugin<ResolvedMyWsAccount> = {
     deliveryMode: "direct",
     chunker: (text, limit) => getMyWsRuntime().channel.text.chunkMarkdownText(text, limit),
     chunkerMode: "markdown",
-    textChunkLimit: 4000,
+    textChunkLimit: 40000,
     resolveTarget: ({ to }) => {
-      const trimmed = to?.trim() ?? "";
-      if (trimmed) {
-        return { ok: true, to: trimmed };
-      }
-      return {
-        ok: false,
-        error: missingTargetError("My WebSocket", "<userId>"),
-      };
+      console.log("resolveTarget")
+      return { ok: true, to: "default" };
     },
     sendText: async ({ cfg, to, text, accountId }) => {
       console.log("sendText")
@@ -249,7 +244,7 @@ export const myWsPlugin: ChannelPlugin<ResolvedMyWsAccount> = {
         );
       }
 
-      ctx.log?.info(`[${account.accountId}] 正在启动 WebSocket 连接: ${account.wsUrl}`);
+      // ctx.log?.info(`[${account.accountId}] 正在启动 WebSocket 连接: ${account.wsUrl}`);
       ctx.setStatus({
         accountId: account.accountId,
         running: true,
