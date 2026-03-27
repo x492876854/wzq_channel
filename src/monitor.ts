@@ -71,6 +71,12 @@ const messageQueue = new AsyncQueue();
 const messageAbortControllers = new Map<string, AbortController>();
 
 /**
+ * chat.stop 已为这些消息 id 提前发送了 done，
+ * 任务结束时不再重复发送。
+ */
+const doneSentByStop = new Set<string>();
+
+/**
  * 活跃的 WebSocket 连接表，key 为 accountId
  * 供 send.ts 发送出站消息时使用
  */
@@ -421,24 +427,16 @@ export async function startMyWsMonitor(opts: MonitorOptions): Promise<{ stop: ()
 
           // ── chat.stop：停止当前生成 + 清空队列 ────────────────
           if (method === "chat.stop") {
-            // abort 所有正在进行的消息
-            let abortedCount = 0;
-            for (const [id, controller] of messageAbortControllers) {
-              logger.info?.(`${logTag} [control] 正在停止消息 id=${id} 的生成`);
-              controller.abort();
-              abortedCount++;
-            }
-            // 清空队列，后续排队的任务也不再执行
+            // 先清空队列，收集待清理信息
             const clearedItems = messageQueue.clear();
-            logger.info?.(`${logTag} [control] chat.stop: 已中止 ${abortedCount} 个任务, 清空队列 ${clearedItems.length} 个待执行任务`);
-            await sendControl({
-              accountId: account.accountId,
-              to: `wzq-channel:${sid}`,
-              reply_id: mid,
-              text: JSON.stringify({ method, data: { stopped: true, abortedCount, clearedQueue: clearedItems.length } }),
-            });
-            // 给每个被清掉的队列任务以及当前 control 消息并行发送 done
-            await Promise.all([
+            // 收集正在执行中的消息 id（用于给它们也发 done）
+            const runningMids = Array.from(messageAbortControllers.keys());
+            const abortedCount = runningMids.length;
+            logger.info?.(`${logTag} [control] chat.stop: 将中止 ${abortedCount} 个任务, 清空队列 ${clearedItems.length} 个待执行任务`);
+
+            // 先发送所有 done + control 消息，不等待结果（fire-and-forget）
+            Promise.all([
+              // 被清掉的队列任务的 done
               ...clearedItems.map((item) =>
                 sendDone({
                   accountId: account.accountId,
@@ -447,13 +445,43 @@ export async function startMyWsMonitor(opts: MonitorOptions): Promise<{ stop: ()
                   reply_id: item.mid,
                 }),
               ),
+              // 正在执行中的消息的 done（不等 AI 调用结束，立即发）
+              ...runningMids.map((runningMid) =>
+                sendDone({
+                  accountId: account.accountId,
+                  to: `wzq-channel:${sid}`,
+                  text: "已停止",
+                  reply_id: runningMid,
+                }),
+              ),
+              // 当前 chat.stop 消息的 done
               sendDone({
                 accountId: account.accountId,
                 to: `wzq-channel:${sid}`,
                 text: "已停止",
                 reply_id: mid,
               }),
-            ]);
+              // control 响应
+              sendControl({
+                accountId: account.accountId,
+                to: `wzq-channel:${sid}`,
+                reply_id: mid,
+                text: JSON.stringify({ method, data: { stopped: true, abortedCount, clearedQueue: clearedItems.length } }),
+              }),
+            ]).catch((err) => {
+              logger.warn?.(`${logTag} [control] chat.stop 发送消息失败（不影响停止）: ${String(err)}`);
+            });
+
+            // 标记这些消息的 done 已由 chat.stop 发出，任务结束时不再重复发
+            for (const runningMid of runningMids) {
+              doneSentByStop.add(runningMid);
+            }
+
+            // 再 abort 所有正在进行的消息
+            for (const [id, controller] of messageAbortControllers) {
+              logger.info?.(`${logTag} [control] 正在停止消息 id=${id} 的生成`);
+              controller.abort();
+            }
             return;
           }
 
@@ -712,19 +740,24 @@ export async function startMyWsMonitor(opts: MonitorOptions): Promise<{ stop: ()
             logger.error(`${logTag} AI 调用异常: ${String(err)}`);
           }
         }
-        // 发送完成状态（abort 时发 "已停止"，正常完成发 "结束"）
-        await sendDone({
-          accountId: account.accountId,
-          to: address,
-          text: currentAbort.signal.aborted ? "已停止" : "结束",
-          reply_id: mid,
-        })
+        // 发送完成状态（如果 chat.stop 已提前发过 done，跳过重复发送）
+        if (!doneSentByStop.has(mid)) {
+          await sendDone({
+            accountId: account.accountId,
+            to: address,
+            text: currentAbort.signal.aborted ? "已停止" : "结束",
+            reply_id: mid,
+          })
+        } else {
+          logger.info?.(`${logTag} done 已由 chat.stop 提前发送，跳过`);
+        }
       } catch (err) {
         logger.error(`[${account.accountId}] 处理入站消息失败: ${String(err)}`);
         statusSink({ lastError: String(err) });
       } finally {
-        // 无论成功失败，清理当前消息的 AbortController
+        // 无论成功失败，清理当前消息的 AbortController 和 doneSentByStop 标记
         messageAbortControllers.delete(mid);
+        doneSentByStop.delete(mid);
       }
       }, { sid, mid }); // messageQueue.enqueue end
     });
