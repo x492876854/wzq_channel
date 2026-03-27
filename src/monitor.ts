@@ -77,6 +77,13 @@ const messageAbortControllers = new Map<string, AbortController>();
 const doneSentByStop = new Set<string>();
 
 /**
+ * 追踪当前正在进行的 gateway chat.abort 调用。
+ * 新消息在开始 AI 调用前必须等待此 Promise 完成，
+ * 避免 chat.abort 异步到达 gateway 时误杀新消息的生成。
+ */
+let pendingAbortPromise: Promise<void> | null = null;
+
+/**
  * 活跃的 WebSocket 连接表，key 为 accountId
  * 供 send.ts 发送出站消息时使用
  */
@@ -641,6 +648,13 @@ export async function startMyWsMonitor(opts: MonitorOptions): Promise<{ stop: ()
           );
           logger.info?.(`${logTag} 开始 AI 调用`);
 
+          // 等待之前的 chat.abort 完成，避免异步到达的 abort 误杀新消息的 AI 生成
+          if (pendingAbortPromise) {
+            logger.info?.(`${logTag} 等待之前的 chat.abort 完成...`);
+            await pendingAbortPromise;
+            logger.info?.(`${logTag} 之前的 chat.abort 已完成`);
+          }
+
           // 如果在开始 AI 调用前就已被 abort，直接跳过
           if (currentAbort.signal.aborted) {
             logger.info?.(`${logTag} AI 调用前已被 abort，跳过`);
@@ -660,14 +674,24 @@ export async function startMyWsMonitor(opts: MonitorOptions): Promise<{ stop: ()
           const dispatchStartTime = lastDeliverTime;
 
           // 监听 abort 信号，通过 gateway chat.abort 中止底层 LLM 请求
-          const onAbort = async () => {
-            try {
-              logger.info?.(`${logTag} 正在通过 gateway chat.abort 中止 AI 生成`);
-              await callGateway("chat.abort", { sessionKey: route.sessionKey });
-              logger.info?.(`${logTag} gateway chat.abort 调用成功`);
-            } catch (err) {
-              logger.warn?.(`${logTag} gateway chat.abort 调用失败: ${String(err)}`);
-            }
+          const onAbort = () => {
+            const abortTask = (async () => {
+              try {
+                logger.info?.(`${logTag} 正在通过 gateway chat.abort 中止 AI 生成`);
+                await callGateway("chat.abort", { sessionKey: route.sessionKey });
+                logger.info?.(`${logTag} gateway chat.abort 调用成功`);
+              } catch (err) {
+                logger.warn?.(`${logTag} gateway chat.abort 调用失败: ${String(err)}`);
+              }
+            })();
+            // 注册到全局，让后续新消息等待 abort 完成再开始 AI 调用
+            const wrappedPromise = abortTask.finally(() => {
+              // 只有当前 promise 仍是自己时才清空，避免覆盖更新的 abort
+              if (pendingAbortPromise === wrappedPromise) {
+                pendingAbortPromise = null;
+              }
+            });
+            pendingAbortPromise = wrappedPromise;
           };
 
           // 如果已被 abort，给前端发送一条信息，成功结束
@@ -685,6 +709,7 @@ export async function startMyWsMonitor(opts: MonitorOptions): Promise<{ stop: ()
 
           currentAbort.signal.addEventListener("abort", () => { onAbort(); }, { once: true });
 
+          logger.info?.(`${logTag} 即将调用 dispatchReplyWithBufferedBlockDispatcher, aborted=${currentAbort.signal.aborted}, doneSentByStop=${doneSentByStop.has(mid)}, doneSentByStopSize=${doneSentByStop.size}`);
           await core.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
             ctx: ctxPayload,
             cfg,
@@ -695,9 +720,10 @@ export async function startMyWsMonitor(opts: MonitorOptions): Promise<{ stop: ()
                 payload: { text?: string; mediaUrl?: string; mediaUrls?: string[] },
                 _info?: { kind?: string },
               ) => {
-                // 如果已被 abort，不再发送后续消息
-                if (currentAbort.signal.aborted) {
-                  logger.info?.(`${logTag} deliver 被跳过（已 abort）`);
+                logger.info?.(`${logTag} deliver 回调被触发, aborted=${currentAbort.signal.aborted}, doneSentByStop=${doneSentByStop.has(mid)}`);
+                // 如果已被 abort 或 chat.stop 已发出 done，不再发送后续消息
+                if (currentAbort.signal.aborted || doneSentByStop.has(mid)) {
+                  logger.info?.(`${logTag} deliver 被跳过（已 abort 或 chat.stop 已处理）`);
                   return;
                 }
 
