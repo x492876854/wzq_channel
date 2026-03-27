@@ -1,5 +1,15 @@
-import type { RuntimeEnv } from "openclaw/plugin-sdk";
-import { buildAgentMediaPayload } from "openclaw/plugin-sdk";
+// ── 兼容新旧版 openclaw SDK ──────────────────────────────────
+let buildAgentMediaPayload: any;
+try {
+  const replyPayload = require("openclaw/plugin-sdk/reply-payload");
+  buildAgentMediaPayload = replyPayload.buildAgentMediaPayload;
+} catch {}
+if (!buildAgentMediaPayload) {
+  try {
+    const sdk = require("openclaw/plugin-sdk");
+    buildAgentMediaPayload = sdk.buildAgentMediaPayload;
+  } catch {}
+}
 import WebSocket from "ws";
 import type { ResolvedMyWsAccount } from "./accounts.js";
 import { getMyWsRuntime } from "./runtime.js";
@@ -10,34 +20,39 @@ const path = require('path');
 const crypto = require('crypto');
 
 
+type QueueItem = {
+  task: () => Promise<void>;
+  meta: { sid: string; mid: string };
+};
+
 /**
  * 简单的异步串行队列：确保同一时间只处理一个任务，
  * 后续任务排队等待，按入队顺序依次执行。
  */
 class AsyncQueue {
-  private queue: (() => Promise<void>)[] = [];
+  private queue: QueueItem[] = [];
   private running = false;
 
-  enqueue(task: () => Promise<void>) {
-    this.queue.push(task);
+  enqueue(task: () => Promise<void>, meta: { sid: string; mid: string }) {
+    this.queue.push({ task, meta });
     if (!this.running) {
       this.run();
     }
   }
 
-  /** 清空队列中所有待执行的任务（不影响正在执行的任务） */
-  clear(): number {
-    const count = this.queue.length;
+  /** 清空队列中所有待执行的任务（不影响正在执行的任务），返回被清掉任务的元信息 */
+  clear(): { sid: string; mid: string }[] {
+    const cleared = this.queue.map((item) => item.meta);
     this.queue = [];
-    return count;
+    return cleared;
   }
 
   private async run() {
     this.running = true;
     while (this.queue.length > 0) {
-      const task = this.queue.shift()!;
+      const item = this.queue.shift()!;
       try {
-        await task();
+        await item.task();
       } catch (err) {
         console.error("[AsyncQueue] 任务执行异常:", err);
       }
@@ -67,7 +82,7 @@ export function getActiveWs(accountId: string): WebSocket | undefined {
 
 export type MonitorOptions = {
   account: ResolvedMyWsAccount;
-  runtime: RuntimeEnv;
+  runtime: any;
   abortSignal: AbortSignal;
   statusSink: (patch: Record<string, unknown>) => void;
   cfg: unknown;
@@ -101,6 +116,134 @@ function imageToDataURL(filePath) {
     console.error('转换失败:', error);
     return null;
   }
+}
+
+/**
+ * 读取 openclaw gateway 配置（端口、token）
+ */
+export function readGatewayConfig(): { port: number; token: string } {
+  let port = 18789;
+  let token = '';
+  try {
+    const configFile = path.join(process.env.HOME || '~', '.openclaw', 'openclaw.json');
+    let rawConfig = fs.readFileSync(configFile, 'utf-8');
+    // 移除单行注释 (// ...)，但不影响字符串内的 // (如 URL、sha512 等)
+    rawConfig = rawConfig.replace(/^((?:[^"]*"(?:[^"\\]|\\.)*")*[^"]*)\/\/.*$/gm, '$1');
+    const config = JSON.parse(rawConfig);
+    port = config.gateway?.port ?? 18789;
+    token = config.gateway?.auth?.token ?? '';
+  } catch (err) {
+    console.warn(`[gateway] 读取 openclaw 配置失败，使用默认端口: ${err}`);
+  }
+  return { port, token };
+}
+
+/**
+ * 通用 gateway RPC 调用
+ * 连接 gateway WS → challenge-response 认证 → 发送指定方法 → 返回 payload
+ */
+export function callGateway(method: string, params: Record<string, any> = {}): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const { port: gatewayPort, token: gatewayToken } = readGatewayConfig();
+    const gwUrl = `ws://127.0.0.1:${gatewayPort}`;
+    const gwWs: any = new WebSocket(gwUrl);
+    let done = false;
+    let connectReqId = '';
+    let rpcReqId = '';
+
+    const timeout = setTimeout(() => {
+      if (!done) {
+        done = true;
+        gwWs.close();
+        reject(new Error(`gateway 请求超时 (10s): ${method}`));
+      }
+    }, 10_000);
+
+    const finish = (result?: any, error?: Error) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timeout);
+      gwWs.close();
+      if (error) reject(error);
+      else resolve(result);
+    };
+
+    gwWs.on('open', () => {
+      console.log(`[gateway] 已连接 ${gwUrl}，准备调用 ${method}`);
+    });
+
+    gwWs.on('message', (data: any) => {
+      try {
+        const msg = JSON.parse(String(data));
+
+        // 步骤1: 收到 challenge，回复 connect 请求
+        if (msg.type === 'event' && msg.event === 'connect.challenge') {
+          connectReqId = crypto.randomUUID();
+          gwWs.send(JSON.stringify({
+            type: 'req',
+            id: connectReqId,
+            method: 'connect',
+            params: {
+              minProtocol: 3,
+              maxProtocol: 3,
+              client: {
+                id: 'gateway-client',
+                displayName: 'wzq-channel',
+                version: '1.0.0',
+                platform: process.platform,
+                mode: 'backend',
+              },
+              caps: [],
+              auth: gatewayToken ? { token: gatewayToken } : undefined,
+              role: 'operator',
+              scopes: ['operator.admin'],
+            },
+          }));
+          return;
+        }
+
+        // 步骤2: connect 响应成功，发送 RPC 请求
+        if (msg.type === 'res' && msg.id === connectReqId) {
+          if (!msg.ok) {
+            finish(undefined, new Error(`gateway 认证失败: ${msg.error?.message || JSON.stringify(msg.error)}`));
+            return;
+          }
+          rpcReqId = crypto.randomUUID();
+          gwWs.send(JSON.stringify({
+            type: 'req',
+            id: rpcReqId,
+            method,
+            params,
+          }));
+          return;
+        }
+
+        // 步骤3: RPC 响应
+        if (msg.type === 'res' && msg.id === rpcReqId) {
+          if (!msg.ok) {
+            finish(undefined, new Error(`${method} 失败: ${msg.error?.message || JSON.stringify(msg.error)}`));
+            return;
+          }
+          finish(msg.payload);
+          return;
+        }
+
+        // 忽略其他事件（tick 等）
+      } catch (err) {
+        finish(undefined, new Error(`解析 gateway 消息失败: ${err}`));
+      }
+    });
+
+    gwWs.on('error', (err: any) => {
+      finish(undefined, new Error(`gateway 连接错误: ${err.message}`));
+    });
+
+    gwWs.on('close', () => {
+      if (!done) {
+        finish(undefined, new Error('gateway 连接意外关闭'));
+      }
+    });
+  });
 }
 
 /**
@@ -178,134 +321,6 @@ export async function startMyWsMonitor(opts: MonitorOptions): Promise<{ stop: ()
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
     }
-  }
-
-  /**
-   * 读取 openclaw gateway 配置（端口、token）
-   */
-  function readGatewayConfig(): { port: number; token: string } {
-    let port = 18789;
-    let token = '';
-    try {
-      const configFile = path.join(process.env.HOME || '~', '.openclaw', 'openclaw.json');
-      let rawConfig = fs.readFileSync(configFile, 'utf-8');
-      // 移除单行注释 (// ...)，但不影响字符串内的 // (如 URL、sha512 等)
-      rawConfig = rawConfig.replace(/^((?:[^"]*"(?:[^"\\]|\\.)*")*[^"]*)\/\/.*$/gm, '$1');
-      const config = JSON.parse(rawConfig);
-      port = config.gateway?.port ?? 18789;
-      token = config.gateway?.auth?.token ?? '';
-    } catch (err) {
-      console.warn(`[gateway] 读取 openclaw 配置失败，使用默认端口: ${err}`);
-    }
-    return { port, token };
-  }
-
-  /**
-   * 通用 gateway RPC 调用
-   * 连接 gateway WS → challenge-response 认证 → 发送指定方法 → 返回 payload
-   */
-  function callGateway(method: string, params: Record<string, any> = {}): Promise<any> {
-    return new Promise((resolve, reject) => {
-      const { port: gatewayPort, token: gatewayToken } = readGatewayConfig();
-      const gwUrl = `ws://127.0.0.1:${gatewayPort}`;
-      const gwWs: any = new WebSocket(gwUrl);
-      let done = false;
-      let connectReqId = '';
-      let rpcReqId = '';
-
-      const timeout = setTimeout(() => {
-        if (!done) {
-          done = true;
-          gwWs.close();
-          reject(new Error(`gateway 请求超时 (10s): ${method}`));
-        }
-      }, 10_000);
-
-      const finish = (result?: any, error?: Error) => {
-        if (done) return;
-        done = true;
-        clearTimeout(timeout);
-        gwWs.close();
-        if (error) reject(error);
-        else resolve(result);
-      };
-
-      gwWs.on('open', () => {
-        console.log(`[gateway] 已连接 ${gwUrl}，准备调用 ${method}`);
-      });
-
-      gwWs.on('message', (data: any) => {
-        try {
-          const msg = JSON.parse(String(data));
-
-          // 步骤1: 收到 challenge，回复 connect 请求
-          if (msg.type === 'event' && msg.event === 'connect.challenge') {
-            connectReqId = crypto.randomUUID();
-            gwWs.send(JSON.stringify({
-              type: 'req',
-              id: connectReqId,
-              method: 'connect',
-              params: {
-                minProtocol: 3,
-                maxProtocol: 3,
-                client: {
-                  id: 'gateway-client',
-                  displayName: 'wzq-channel',
-                  version: '1.0.0',
-                  platform: process.platform,
-                  mode: 'backend',
-                },
-                caps: [],
-                auth: gatewayToken ? { token: gatewayToken } : undefined,
-                role: 'operator',
-                scopes: ['operator.admin'],
-              },
-            }));
-            return;
-          }
-
-          // 步骤2: connect 响应成功，发送 RPC 请求
-          if (msg.type === 'res' && msg.id === connectReqId) {
-            if (!msg.ok) {
-              finish(undefined, new Error(`gateway 认证失败: ${msg.error?.message || JSON.stringify(msg.error)}`));
-              return;
-            }
-            rpcReqId = crypto.randomUUID();
-            gwWs.send(JSON.stringify({
-              type: 'req',
-              id: rpcReqId,
-              method,
-              params,
-            }));
-            return;
-          }
-
-          // 步骤3: RPC 响应
-          if (msg.type === 'res' && msg.id === rpcReqId) {
-            if (!msg.ok) {
-              finish(undefined, new Error(`${method} 失败: ${msg.error?.message || JSON.stringify(msg.error)}`));
-              return;
-            }
-            finish(msg.payload);
-            return;
-          }
-
-          // 忽略其他事件（tick 等）
-        } catch (err) {
-          finish(undefined, new Error(`解析 gateway 消息失败: ${err}`));
-        }
-      });
-
-      gwWs.on('error', (err: any) => {
-        finish(undefined, new Error(`gateway 连接错误: ${err.message}`));
-      });
-
-      gwWs.on('close', () => {
-        if (!done) {
-          finish(undefined, new Error('gateway 连接意外关闭'));
-        }
-      });
-    });
   }
 
   function connect() {
@@ -414,14 +429,31 @@ export async function startMyWsMonitor(opts: MonitorOptions): Promise<{ stop: ()
               abortedCount++;
             }
             // 清空队列，后续排队的任务也不再执行
-            const cleared = messageQueue.clear();
-            logger.info?.(`${logTag} [control] chat.stop: 已中止 ${abortedCount} 个任务, 清空队列 ${cleared} 个待执行任务`);
+            const clearedItems = messageQueue.clear();
+            logger.info?.(`${logTag} [control] chat.stop: 已中止 ${abortedCount} 个任务, 清空队列 ${clearedItems.length} 个待执行任务`);
             await sendControl({
               accountId: account.accountId,
               to: `wzq-channel:${sid}`,
               reply_id: mid,
-              text: JSON.stringify({ method, data: { stopped: true, abortedCount, clearedQueue: cleared } }),
+              text: JSON.stringify({ method, data: { stopped: true, abortedCount, clearedQueue: clearedItems.length } }),
             });
+            // 给每个被清掉的队列任务以及当前 control 消息并行发送 done
+            await Promise.all([
+              ...clearedItems.map((item) =>
+                sendDone({
+                  accountId: account.accountId,
+                  to: `wzq-channel:${item.sid}`,
+                  text: "已停止",
+                  reply_id: item.mid,
+                }),
+              ),
+              sendDone({
+                accountId: account.accountId,
+                to: `wzq-channel:${sid}`,
+                text: "已停止",
+                reply_id: mid,
+              }),
+            ]);
             return;
           }
 
@@ -525,8 +557,10 @@ export async function startMyWsMonitor(opts: MonitorOptions): Promise<{ stop: ()
           msg.content = JSON.stringify(newTmpMsgList);
         }
 
-        // 使用 buildAgentMediaPayload 构建标准媒体字段
-        const mediaPayload = buildAgentMediaPayload(mediaList);
+        // 使用 buildAgentMediaPayload 构建标准媒体字段（兼容旧版 SDK）
+        const mediaPayload = typeof buildAgentMediaPayload === "function"
+          ? buildAgentMediaPayload(mediaList)
+          : {};
 
         const session_id = msg.session_id // Date.now().toString()
         const route = core.channel.routing.resolveAgentRoute({
@@ -692,7 +726,7 @@ export async function startMyWsMonitor(opts: MonitorOptions): Promise<{ stop: ()
         // 无论成功失败，清理当前消息的 AbortController
         messageAbortControllers.delete(mid);
       }
-      }); // messageQueue.enqueue end
+      }, { sid, mid }); // messageQueue.enqueue end
     });
 
     ws.on("error", (err) => {

@@ -1,5 +1,19 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk";
-import { DEFAULT_ACCOUNT_ID } from "openclaw/plugin-sdk";
+// ── 兼容新旧版 openclaw SDK ──────────────────────────────────
+// 新版：openclaw/plugin-sdk/core  旧版：openclaw/plugin-sdk
+let OpenClawConfig: any; // 仅用于类型标注，运行时不需要
+
+let DEFAULT_ACCOUNT_ID: string = "default";
+try {
+  const core = require("openclaw/plugin-sdk/core");
+  if (core.DEFAULT_ACCOUNT_ID != null) DEFAULT_ACCOUNT_ID = core.DEFAULT_ACCOUNT_ID;
+} catch {}
+try {
+  const sdk = require("openclaw/plugin-sdk");
+  if (sdk.DEFAULT_ACCOUNT_ID != null && DEFAULT_ACCOUNT_ID === "default") {
+    DEFAULT_ACCOUNT_ID = sdk.DEFAULT_ACCOUNT_ID;
+  }
+} catch {}
+export { DEFAULT_ACCOUNT_ID };
 
 /**
  * 单个账户的原始配置（来自 config.json5 中 channels.wzq-channel）
@@ -34,11 +48,11 @@ export type ResolvedMyWsAccount = {
   config: MyWsChannelConfig;
 };
 
-function getRootConfig(cfg: OpenClawConfig): MyWsChannelConfig | undefined {
+function getRootConfig(cfg: any): MyWsChannelConfig | undefined {
   return (cfg.channels as Record<string, MyWsChannelConfig> | undefined)?.["wzq-channel"];
 }
 
-export function listMyWsAccountIds(cfg: OpenClawConfig): string[] {
+export function listMyWsAccountIds(cfg: any): string[] {
   const root = getRootConfig(cfg);
   if (!root) return [];
   const subAccounts = Object.keys(root.accounts ?? {});
@@ -46,7 +60,7 @@ export function listMyWsAccountIds(cfg: OpenClawConfig): string[] {
 }
 
 export function resolveMyWsAccount(
-  cfg: OpenClawConfig,
+  cfg: any,
   accountId?: string | null,
 ): ResolvedMyWsAccount {
   const root = getRootConfig(cfg);
@@ -58,7 +72,7 @@ export function resolveMyWsAccount(
 
   const wsUrl = accountCfg.wsUrl?.trim() ?? "";
   const token = accountCfg.token?.trim() || undefined;
-  const fileUrl = accountCfg.fileUrl.trim() ?? "";
+  const fileUrl = accountCfg.fileUrl?.trim() ?? "";
   const enabled = accountCfg.enabled !== false;
   const configured = Boolean(wsUrl);
 

@@ -1,26 +1,88 @@
-import {
-  buildBaseAccountStatusSnapshot,
-  buildBaseChannelStatusSummary,
-  buildChannelConfigSchema,
-  DEFAULT_ACCOUNT_ID,
-  deleteAccountFromConfigSection,
-  formatPairingApproveHint,
-  getChatChannelMeta,
-  missingTargetError,
-  PAIRING_APPROVED_MESSAGE,
-  setAccountEnabledInConfigSection,
-  type ChannelPlugin,
-} from "openclaw/plugin-sdk";
+// ── 兼容新旧版 openclaw SDK ──────────────────────────────────
+// 新版 SDK 将导入路径细分为 openclaw/plugin-sdk/<subpath>
+// 旧版 SDK 从 openclaw/plugin-sdk 根路径导出
+// 这里依次尝试新版子路径 → 旧版根路径 → 内置 fallback
+
+// --- SDK 辅助函数声明 ---
+let createChatChannelPlugin: any;
+let createChannelPluginBase: any;
+let buildBaseAccountStatusSnapshot: any;
+let buildBaseChannelStatusSummary: any;
+let buildChannelConfigSchema: any;
+let DEFAULT_ACCOUNT_ID: string = "default";
+let deleteAccountFromConfigSection: any;
+let formatPairingApproveHint: any;
+let getChatChannelMeta: any;
+let missingTargetError: any;
+let PAIRING_APPROVED_MESSAGE: string = "Pairing approved ✓";
+let setAccountEnabledInConfigSection: any;
+
+// 尝试新版子路径导入
+try {
+  const core = require("openclaw/plugin-sdk/core");
+  createChatChannelPlugin = core.createChatChannelPlugin;
+  createChannelPluginBase = core.createChannelPluginBase;
+  if (core.DEFAULT_ACCOUNT_ID != null) DEFAULT_ACCOUNT_ID = core.DEFAULT_ACCOUNT_ID;
+} catch {}
+
+try {
+  const helpers = require("openclaw/plugin-sdk/channel-config-helpers");
+  buildChannelConfigSchema = helpers.buildChannelConfigSchema ?? helpers.createHybridChannelConfigAdapter;
+  deleteAccountFromConfigSection = helpers.deleteAccountFromConfigSection;
+  setAccountEnabledInConfigSection = helpers.setAccountEnabledInConfigSection;
+} catch {}
+
+try {
+  const lifecycle = require("openclaw/plugin-sdk/channel-lifecycle");
+  buildBaseAccountStatusSnapshot = lifecycle.buildBaseAccountStatusSnapshot ?? lifecycle.createAccountStatusSink;
+  buildBaseChannelStatusSummary = lifecycle.buildBaseChannelStatusSummary;
+} catch {}
+
+try {
+  const schema = require("openclaw/plugin-sdk/channel-config-schema");
+  if (!buildChannelConfigSchema) buildChannelConfigSchema = schema.buildChannelConfigSchema;
+} catch {}
+
+try {
+  const pairing = require("openclaw/plugin-sdk/channel-pairing");
+  formatPairingApproveHint = pairing.formatPairingApproveHint;
+  if (pairing.PAIRING_APPROVED_MESSAGE != null) PAIRING_APPROVED_MESSAGE = pairing.PAIRING_APPROVED_MESSAGE;
+} catch {}
+
+// 旧版根路径 fallback（兼容未迁移的环境）
+try {
+  const sdk = require("openclaw/plugin-sdk");
+  if (!buildBaseAccountStatusSnapshot) buildBaseAccountStatusSnapshot = sdk.buildBaseAccountStatusSnapshot;
+  if (!buildBaseChannelStatusSummary) buildBaseChannelStatusSummary = sdk.buildBaseChannelStatusSummary;
+  if (!buildChannelConfigSchema) buildChannelConfigSchema = sdk.buildChannelConfigSchema;
+  if (sdk.DEFAULT_ACCOUNT_ID != null && DEFAULT_ACCOUNT_ID === "default") DEFAULT_ACCOUNT_ID = sdk.DEFAULT_ACCOUNT_ID;
+  if (!deleteAccountFromConfigSection) deleteAccountFromConfigSection = sdk.deleteAccountFromConfigSection;
+  if (!formatPairingApproveHint) formatPairingApproveHint = sdk.formatPairingApproveHint;
+  if (!getChatChannelMeta) getChatChannelMeta = sdk.getChatChannelMeta;
+  if (!missingTargetError) missingTargetError = sdk.missingTargetError;
+  if (sdk.PAIRING_APPROVED_MESSAGE != null && PAIRING_APPROVED_MESSAGE === "Pairing approved ✓") {
+    PAIRING_APPROVED_MESSAGE = sdk.PAIRING_APPROVED_MESSAGE;
+  }
+  if (!setAccountEnabledInConfigSection) setAccountEnabledInConfigSection = sdk.setAccountEnabledInConfigSection;
+} catch {}
+
 import {
   listMyWsAccountIds,
   resolveMyWsAccount,
   type ResolvedMyWsAccount,
 } from "./accounts.js";
-import { startMyWsMonitor } from "./monitor.js";
+import { startMyWsMonitor, callGateway } from "./monitor.js";
 import { getMyWsRuntime } from "./runtime.js";
 import { sendMyWsMessage } from "./send.js";
 
-const meta = getChatChannelMeta("wzq-channel");
+// 兼容：getChatChannelMeta 在新版 SDK 中可能已移入 core 或不再存在
+const meta = typeof getChatChannelMeta === "function"
+  ? getChatChannelMeta("wzq-channel")
+  : {
+      id: "wzq-channel",
+      label: "wzq-channel",
+      selectionLabel: "wzq-channel",
+    };
 
 /**
  * 规范化 allowFrom 条目：去除空白和可选的 "wzq-channel:" 前缀
@@ -39,7 +101,7 @@ function normalizeTarget(raw: string): string | null {
   return trimmed || null;
 }
 
-export const myWsPlugin: ChannelPlugin<ResolvedMyWsAccount> = {
+export const myWsPlugin: any = {
   id: "wzq-channel",
   meta: {
     ...meta,
@@ -59,50 +121,56 @@ export const myWsPlugin: ChannelPlugin<ResolvedMyWsAccount> = {
   reload: { configPrefixes: ["channels.wzq-channel"] },
 
   // ── 配置 Schema（无额外插件级配置，使用空 schema）────────
-  configSchema: buildChannelConfigSchema({}),
+  configSchema: typeof buildChannelConfigSchema === "function"
+    ? buildChannelConfigSchema({})
+    : { type: "object", properties: {} },
 
   // ── 账户配置解析 ──────────────────────────────────────────
   config: {
-    listAccountIds: (cfg) => listMyWsAccountIds(cfg),
-    resolveAccount: (cfg, accountId) => resolveMyWsAccount(cfg, accountId),
+    listAccountIds: (cfg: any) => listMyWsAccountIds(cfg),
+    resolveAccount: (cfg: any, accountId: any) => resolveMyWsAccount(cfg, accountId),
     defaultAccountId: () => DEFAULT_ACCOUNT_ID,
-    setAccountEnabled: ({ cfg, accountId, enabled }) =>
-      setAccountEnabledInConfigSection({
-        cfg,
-        sectionKey: "wzq-channel",
-        accountId,
-        enabled,
-        allowTopLevel: true,
-      }),
-    deleteAccount: ({ cfg, accountId }) =>
-      deleteAccountFromConfigSection({
-        cfg,
-        sectionKey: "wzq-channel",
-        accountId,
-        clearBaseFields: ["wsUrl", "token", "fileUrl", "allowFrom", "defaultTo"],
-      }),
-    isConfigured: (account) => account.configured,
-    describeAccount: (account) => ({
+    setAccountEnabled: typeof setAccountEnabledInConfigSection === "function"
+      ? ({ cfg, accountId, enabled }: any) =>
+          setAccountEnabledInConfigSection({
+            cfg,
+            sectionKey: "wzq-channel",
+            accountId,
+            enabled,
+            allowTopLevel: true,
+          })
+      : ({ cfg }: any) => cfg,
+    deleteAccount: typeof deleteAccountFromConfigSection === "function"
+      ? ({ cfg, accountId }: any) =>
+          deleteAccountFromConfigSection({
+            cfg,
+            sectionKey: "wzq-channel",
+            accountId,
+            clearBaseFields: ["wsUrl", "token", "fileUrl", "allowFrom", "defaultTo"],
+          })
+      : ({ cfg }: any) => cfg,
+    isConfigured: (account: any) => account.configured,
+    describeAccount: (account: any) => ({
       accountId: account.accountId,
       enabled: account.enabled,
       configured: account.configured,
       wsUrl: account.wsUrl,
       fileUrl: account.fileUrl
     }),
-    resolveAllowFrom: ({ cfg, accountId }) =>
-      (resolveMyWsAccount(cfg, accountId).config.allowFrom ?? []).map((entry) => String(entry)),
-    formatAllowFrom: ({ allowFrom }) =>
+    resolveAllowFrom: ({ cfg, accountId }: any) =>
+      (resolveMyWsAccount(cfg, accountId).config.allowFrom ?? []).map((entry: any) => String(entry)),
+    formatAllowFrom: ({ allowFrom }: any) =>
       allowFrom
-        .map((entry) => String(entry))
+        .map((entry: any) => String(entry))
         .filter(Boolean)
         .map(formatAllowFromEntry),
-    resolveDefaultTo: ({ cfg, accountId }) =>
+    resolveDefaultTo: ({ cfg, accountId }: any) =>
       resolveMyWsAccount(cfg, accountId).config.defaultTo?.trim() || undefined,
   },
 
   // ── 安全策略 ──────────────────────────────────────────────
   security: {
-    resolveDmPolicy: ({ cfg, accountId, account }) => {
+    resolveDmPolicy: ({ cfg, accountId, account }: any) => {
       const resolvedAccountId = accountId ?? account.accountId ?? DEFAULT_ACCOUNT_ID;
       const useAccountPath = Boolean(
         (cfg.channels as Record<string, { accounts?: Record<string, unknown> }> | undefined)?.[
@@ -117,8 +185,10 @@ export const myWsPlugin: ChannelPlugin<ResolvedMyWsAccount> = {
         allowFrom: account.config.allowFrom ?? [],
         policyPath: `${basePath}dmPolicy`,
         allowFromPath: `${basePath}allowFrom`,
-        approveHint: formatPairingApproveHint("wzq-channel"),
-        normalizeEntry: (raw) => formatAllowFromEntry(raw),
+        approveHint: typeof formatPairingApproveHint === "function"
+          ? formatPairingApproveHint("wzq-channel")
+          : "Approve pairing for wzq-channel",
+        normalizeEntry: (raw: any) => formatAllowFromEntry(raw),
       };
     },
     collectWarnings: () => [],
@@ -127,8 +197,8 @@ export const myWsPlugin: ChannelPlugin<ResolvedMyWsAccount> = {
   // ── Pairing（配对）────────────────────────────────────────
   pairing: {
     idLabel: "wsUserId",
-    normalizeAllowEntry: (entry) => formatAllowFromEntry(entry),
-    notifyApproval: async ({ cfg, id }) => {
+    normalizeAllowEntry: (entry: any) => formatAllowFromEntry(entry),
+    notifyApproval: async ({ cfg, id }: any) => {
       const account = resolveMyWsAccount(cfg);
       if (!account.configured) return;
       await sendMyWsMessage({
@@ -141,17 +211,17 @@ export const myWsPlugin: ChannelPlugin<ResolvedMyWsAccount> = {
 
   // ── 消息目标规范化 ────────────────────────────────────────
   messaging: {
-    normalizeTarget: (raw) => normalizeTarget(raw),
+    normalizeTarget: (raw: any) => normalizeTarget(raw),
     targetResolver: {
-      looksLikeId: (raw, normalized) => Boolean(normalized ?? raw.trim()),
+      looksLikeId: (raw: any, normalized: any) => Boolean(normalized ?? raw.trim()),
       hint: "<userId>",
     },
   },
 
   // ── 目标解析器 ────────────────────────────────────────────
   resolver: {
-    resolveTargets: async ({ inputs }) => {
-      return inputs.map((input) => {
+    resolveTargets: async ({ inputs }: any) => {
+      return inputs.map((input: any) => {
         const normalized = normalizeTarget(input);
         if (!normalized) {
           return { input, resolved: false as const, note: "目标 ID 不能为空" };
@@ -164,7 +234,7 @@ export const myWsPlugin: ChannelPlugin<ResolvedMyWsAccount> = {
   // ── 目录（联系人列表）────────────────────────────────────
   directory: {
     self: async () => null,
-    listPeers: async ({ cfg, accountId, query, limit }) => {
+    listPeers: async ({ cfg, accountId, query, limit }: any) => {
       const account = resolveMyWsAccount(cfg, accountId);
       const q = query?.trim().toLowerCase() ?? "";
       const ids = new Set<string>();
@@ -185,14 +255,14 @@ export const myWsPlugin: ChannelPlugin<ResolvedMyWsAccount> = {
   // ── 出站消息发送 ──────────────────────────────────────────
   outbound: {
     deliveryMode: "direct",
-    chunker: (text, limit) => getMyWsRuntime().channel.text.chunkMarkdownText(text, limit),
+    chunker: (text: any, limit: any) => getMyWsRuntime().channel.text.chunkMarkdownText(text, limit),
     chunkerMode: "markdown",
     textChunkLimit: 40000,
-    resolveTarget: ({ to }) => {
+    resolveTarget: ({ to }: any) => {
       console.log("resolveTarget")
       return { ok: true, to: "default" };
     },
-    sendText: async ({ cfg, to, text, accountId }) => {
+    sendText: async ({ cfg, to, text, accountId }: any) => {
       console.log("sendText", text)
       const account = resolveMyWsAccount(cfg, accountId);
       const result = await sendMyWsMessage({
@@ -201,13 +271,26 @@ export const myWsPlugin: ChannelPlugin<ResolvedMyWsAccount> = {
         text,
         reply_id: "system",
       });
+
+      // 将 text 注入到 agent 的 session 中
+      /*const sessionKey = "agent:main:wzq-channel:direct:sess:20260327";
+      try {
+        await callGateway("chat.inject", {
+          sessionKey,
+          message: text,
+        });
+        console.log(`[sendText] 已注入消息到 session: ${sessionKey}`);
+      } catch (err) {
+        console.error(`[sendText] 注入消息到 session 失败: ${err}`);
+      }*/
+
       return {
         channel: "wzq-channel",
         messageId: result.messageId,
         chatId: result.chatId,
       };
     },
-    sendMedia: async ({ cfg, to, accountId }) => {
+    sendMedia: async ({ cfg, to, accountId }: any) => {
       console.log("sendMedia")
       // 先不支持发送媒体资源
       return {
@@ -225,18 +308,22 @@ export const myWsPlugin: ChannelPlugin<ResolvedMyWsAccount> = {
       lastStopAt: null,
       lastError: null,
     },
-    buildChannelSummary: ({ snapshot }) => ({
-      ...buildBaseChannelStatusSummary(snapshot),
+    buildChannelSummary: ({ snapshot }: any) => ({
+      ...(typeof buildBaseChannelStatusSummary === "function"
+        ? buildBaseChannelStatusSummary(snapshot)
+        : snapshot),
     }),
-    buildAccountSnapshot: ({ account, runtime }) => ({
-      ...buildBaseAccountStatusSnapshot({ account, runtime }),
+    buildAccountSnapshot: ({ account, runtime }: any) => ({
+      ...(typeof buildBaseAccountStatusSnapshot === "function"
+        ? buildBaseAccountStatusSnapshot({ account, runtime })
+        : { account, runtime }),
       wsUrl: account.wsUrl,
     }),
   },
 
   // ── Gateway：WebSocket 长连接入站监听 ─────────────────────
   gateway: {
-    startAccount: async (ctx) => {
+    startAccount: async (ctx: any) => {
       const { account, } = ctx;
       if (!account.configured) {
         throw new Error(
@@ -257,7 +344,7 @@ export const myWsPlugin: ChannelPlugin<ResolvedMyWsAccount> = {
         cfg: ctx.cfg,
         runtime: ctx.runtime,
         abortSignal: ctx.abortSignal,
-        statusSink: (patch) => ctx.setStatus({ accountId: account.accountId, ...patch }),
+        statusSink: (patch: any) => ctx.setStatus({ accountId: account.accountId, ...patch }),
       });
     },
   },
