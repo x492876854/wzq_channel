@@ -273,7 +273,7 @@ export const myWsPlugin: any = {
       });
 
       // 将 text 注入到 agent 的 session 中
-      /*const sessionKey = "agent:main:wzq-channel:direct:sess:20260327";
+      const sessionKey = "agent:main:wzq-channel:direct:zxgmain";
       try {
         await callGateway("chat.inject", {
           sessionKey,
@@ -282,7 +282,7 @@ export const myWsPlugin: any = {
         console.log(`[sendText] 已注入消息到 session: ${sessionKey}`);
       } catch (err) {
         console.error(`[sendText] 注入消息到 session 失败: ${err}`);
-      }*/
+      }
 
       return {
         channel: "wzq-channel",
